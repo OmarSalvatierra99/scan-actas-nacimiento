@@ -2,9 +2,12 @@ import re
 import os
 import base64
 import tempfile
+import gc
 from io import BytesIO
 from threading import RLock
 from datetime import datetime
+from functools import wraps
+import time
 
 import openpyxl
 from openpyxl import Workbook
@@ -14,6 +17,11 @@ import numpy as np
 import fitz  # PyMuPDF
 
 app = Flask(__name__)
+
+# ===== Configuración de límites =====
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB por archivo
+MAX_PDF_PAGES = 100  # Máximo de páginas por PDF para procesamiento
+ALLOWED_EXTENSIONS = {'pdf'}
 
 # ===== Config =====
 ENCABEZADOS = [
@@ -27,7 +35,40 @@ REGISTROS = []
 _LOCK = RLock()
 
 
-# ===== Utilidades =====
+# ===== Utilidades de validación =====
+def allowed_file(filename):
+    """Verifica si el archivo tiene una extensión permitida."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def validate_pdf_file(file):
+    """Valida tamaño y formato del archivo PDF."""
+    if not file:
+        return False, "No se recibió archivo"
+
+    if not allowed_file(file.filename):
+        return False, "El archivo debe ser un PDF"
+
+    # Leer el archivo para verificar tamaño
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    if file_size > MAX_FILE_SIZE:
+        return False, f"El archivo excede el tamaño máximo de {MAX_FILE_SIZE // (1024*1024)} MB"
+
+    if file_size == 0:
+        return False, "El archivo está vacío"
+
+    return True, "OK"
+
+
+def cleanup_memory():
+    """Fuerza la liberación de memoria."""
+    gc.collect()
+
+
+# ===== Utilidades de procesamiento =====
 def normalizar_clave(raw_key):
     mapeo_claves = {
         'padre1': 'Padre',
@@ -118,32 +159,79 @@ def procesar_imagen_qr(image_data):
 
 
 def extraer_qr_desde_pdf(pdf_bytes):
-    """Usa archivo temporal y lo borra inmediatamente."""
+    """Extrae códigos QR de un PDF de forma optimizada."""
+    temp_path = None
+    pdf_document = None
+    qr_codes = []
+
     try:
+        # Crear archivo temporal
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
             temp_file.write(pdf_bytes)
             temp_path = temp_file.name
 
-        qr_codes = []
+        # Abrir PDF
         pdf_document = fitz.open(temp_path)
 
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_data = pix.tobytes("png")
-            np_array = np.frombuffer(img_data, np.uint8)
-            img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-            if img is not None:
-                qr_detector = cv2.QRCodeDetector()
-                data, bbox, _ = qr_detector.detectAndDecode(img)
-                if data and data.strip():
-                    qr_codes.append(data.strip())
+        # Limitar número de páginas
+        total_pages = len(pdf_document)
+        max_pages = min(total_pages, MAX_PDF_PAGES)
 
-        pdf_document.close()
-        os.unlink(temp_path)
-        return qr_codes
-    except Exception:
+        # Procesar cada página
+        for page_num in range(max_pages):
+            try:
+                page = pdf_document.load_page(page_num)
+
+                # Renderizar con menor resolución para mejorar velocidad
+                # Factor 2 es suficiente para QR
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_data = pix.tobytes("png")
+
+                # Liberar memoria de pixmap
+                pix = None
+
+                # Decodificar imagen
+                np_array = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+
+                if img is not None:
+                    # Detectar QR
+                    qr_detector = cv2.QRCodeDetector()
+                    data, bbox, _ = qr_detector.detectAndDecode(img)
+
+                    if data and data.strip():
+                        qr_codes.append(data.strip())
+
+                        # Si encontramos QR, detener (optimización para actas de 1 página)
+                        # Comentar esta línea si las actas pueden tener múltiples páginas con QR
+                        break
+
+                # Liberar memoria de imagen
+                img = None
+                np_array = None
+
+            except Exception as e:
+                # Continuar con la siguiente página si hay error
+                continue
+
+    except Exception as e:
         return []
+
+    finally:
+        # Limpieza garantizada
+        if pdf_document:
+            pdf_document.close()
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+        # Forzar liberación de memoria
+        cleanup_memory()
+
+    return qr_codes
 
 
 def convertir_fecha(fecha_str):
@@ -220,21 +308,45 @@ def parsear_texto_acta(texto):
 
 
 def extraer_datos_desde_texto_pdf(pdf_bytes):
+    """Extrae datos de texto de un PDF de forma optimizada."""
+    temp_path = None
+    pdf_document = None
+
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
             temp_file.write(pdf_bytes)
             temp_path = temp_file.name
 
         pdf_document = fitz.open(temp_path)
+
+        # Limitar páginas procesadas
+        total_pages = len(pdf_document)
+        max_pages = min(total_pages, MAX_PDF_PAGES)
+
         texto = ""
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
-            texto += page.get_text()
-        pdf_document.close()
-        os.unlink(temp_path)
+        for page_num in range(max_pages):
+            try:
+                page = pdf_document.load_page(page_num)
+                texto += page.get_text()
+            except:
+                continue
+
         return parsear_texto_acta(texto)
+
     except Exception:
         return None
+
+    finally:
+        if pdf_document:
+            pdf_document.close()
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+        cleanup_memory()
 
 
 def procesar_pdf_con_fallback(pdf_bytes):
@@ -298,41 +410,88 @@ def procesar_imagen_qr_route():
 
 @app.route('/procesar_pdf', methods=['POST'])
 def procesar_pdf():
+    """
+    Procesa un archivo PDF para extraer datos de actas de nacimiento.
+    Optimizado para manejar grandes volúmenes.
+    """
     try:
+        # Validar que se recibió el archivo
         if 'pdf_file' not in request.files:
             return jsonify({'success': False, 'message': 'No se recibió archivo PDF'})
+
         pdf_file = request.files['pdf_file']
-        if not pdf_file.filename.lower().endswith('.pdf'):
-            return jsonify({'success': False, 'message': 'El archivo debe ser un PDF'})
 
+        # Validar archivo
+        valid, error_msg = validate_pdf_file(pdf_file)
+        if not valid:
+            return jsonify({'success': False, 'message': error_msg})
+
+        # Leer contenido del archivo
         pdf_bytes = pdf_file.read()
-        hallados, metodo = procesar_pdf_con_fallback(pdf_bytes)
-        if not hallados:
-            return jsonify({'success': False, 'message': 'Sin QR y sin texto útil'})
 
+        # Validar que el PDF no esté corrupto
+        if not pdf_bytes or len(pdf_bytes) < 100:
+            return jsonify({'success': False, 'message': 'El archivo PDF parece estar corrupto o vacío'})
+
+        # Procesar PDF con fallback
+        hallados, metodo = procesar_pdf_con_fallback(pdf_bytes)
+
+        # Liberar memoria del archivo
+        pdf_bytes = None
+        cleanup_memory()
+
+        if not hallados:
+            return jsonify({'success': False, 'message': 'No se pudo extraer información del PDF. Verifique que sea un acta de nacimiento válida con código QR.'})
+
+        # Procesar registros encontrados
         resultados = []
         ok = 0
-        for item in hallados:
-            if metodo == 'qr':
-                registro = parsear_qr(item)
-            else:
-                registro = item
-            success, message = guardar_registro(registro)
-            resultados.append({'metodo': metodo, 'success': success, 'message': message})
-            if success:
-                ok += 1
+        errores = []
 
+        for item in hallados:
+            try:
+                if metodo == 'qr':
+                    registro = parsear_qr(item)
+                else:
+                    registro = item
+
+                success, message = guardar_registro(registro)
+                resultados.append({'metodo': metodo, 'success': success, 'message': message})
+
+                if success:
+                    ok += 1
+                else:
+                    errores.append(message)
+
+            except Exception as e:
+                errores.append(f'Error al procesar registro: {str(e)}')
+
+        # Renderizar tabla actualizada
         tabla_html = render_template('_tabla_registros.html', registros=obtener_registros())
+
+        # Construir mensaje de respuesta
+        mensaje = f'Procesados {ok} de {len(hallados)} registros exitosamente'
+        if errores:
+            mensaje += f'. {len(errores)} error(es)'
+
         return jsonify({
-            'success': True,
-            'message': f'Procesados {ok}/{len(hallados)} usando {metodo}',
+            'success': ok > 0,
+            'message': mensaje,
             'metodo_utilizado': metodo,
             'resultados': resultados,
             'total_registros': len(obtener_registros()),
-            'tabla_html': tabla_html
+            'tabla_html': tabla_html,
+            'procesados': ok,
+            'total': len(hallados),
+            'errores': len(errores)
         })
+
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error procesando PDF: {str(e)}'}), 500
+        cleanup_memory()
+        return jsonify({
+            'success': False,
+            'message': f'Error procesando PDF: {str(e)}'
+        }), 500
 
 
 @app.route('/descargar_excel')

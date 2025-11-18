@@ -43,30 +43,51 @@
       <div id="pdf-tab" class="tab-content active">
         <div class="pdf-container">
           <div class="pdf-instructions">
-            <h3>Instrucciones para subir acta PDF</h3>
+            <h3>📋 Instrucciones para procesar actas PDF</h3>
             <ol>
-              <li>Seleccione el archivo PDF del acta.</li>
-              <li>El sistema detectará el QR o extraerá datos del texto.</li>
-              <li>Se registrarán todas las actas válidas.</li>
+              <li>Arrastre y suelte uno o múltiples archivos PDF en la zona de carga</li>
+              <li>El sistema detectará automáticamente códigos QR o extraerá datos del texto</li>
+              <li>Procese hasta cientos de actas simultáneamente con seguimiento en tiempo real</li>
+              <li>Los registros válidos se agregarán automáticamente a la tabla</li>
             </ol>
           </div>
 
-          <div class="form-group">
-            <input type="file" id="pdfInput" accept=".pdf" class="file-input" style="display: none;">
-            <label for="pdfInput" class="btn btn-primary">📄 Seleccionar PDF</label>
-            <span id="pdfFileName"></span>
+          <!-- Dropzone para Drag & Drop -->
+          <div id="dropzone" class="dropzone">
+            <span class="dropzone-icon">📁</span>
+            <div class="dropzone-text">Arrastre archivos PDF aquí</div>
+            <div class="dropzone-hint">o haga clic para seleccionar archivos (puede seleccionar múltiples)</div>
+            <input type="file" id="pdfInput" accept=".pdf" multiple style="display: none;">
           </div>
 
-          <div id="pdfProgress" style="display:none;">
-            <div class="message info">
-              <p>Procesando PDF...</p>
-              <div style="background:#e2e8f0;border-radius:10px;height:10px;margin:10px 0;">
-                <div id="pdfProgressBar" style="background:var(--color-primary-light);height:100%;width:0%;border-radius:10px;transition:width 0.3s;"></div>
-              </div>
+          <!-- Lista de archivos seleccionados -->
+          <div id="fileList" class="file-list" style="display: none;"></div>
+
+          <!-- Controles de procesamiento batch -->
+          <div id="batchControls" class="batch-controls" style="display: none;">
+            <button id="btnProcessBatch" class="btn btn-primary">
+              🚀 Procesar todos los archivos (<span id="fileCount">0</span>)
+            </button>
+            <button id="btnClearFiles" class="btn btn-error">
+              🗑️ Limpiar lista
+            </button>
+          </div>
+
+          <!-- Progreso general -->
+          <div id="overallProgress" style="display: none; margin-top: 1.5rem;">
+            <div style="margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-weight: 600; color: var(--color-primary);">
+                <span class="spinner" style="margin-right: 0.5rem;"></span>
+                Procesando: <span id="progressText">0 de 0</span>
+              </span>
+              <span style="color: var(--color-muted); font-size: 0.9rem;">
+                <span id="successCount">0</span> exitosos · <span id="errorCount">0</span> errores
+              </span>
+            </div>
+            <div class="progress-bar-container">
+              <div id="overallProgressBar" class="progress-bar" style="width: 0%;"></div>
             </div>
           </div>
-
-          <div id="pdfResults"></div>
         </div>
       </div>
 
@@ -131,7 +152,34 @@
 
     <section class="table-panel">
       <h2>📋 Actas Escaneadas (más recientes primero)</h2>
+
+      <!-- Controles de tabla: búsqueda y filtros -->
+      <div class="table-controls">
+        <div class="search-box">
+          <span class="search-icon">🔍</span>
+          <input
+            type="text"
+            id="searchInput"
+            class="search-input"
+            placeholder="Buscar por nombre, CURP, municipio..."
+          />
+        </div>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <span style="color: var(--color-muted); font-size: 0.9rem;">Mostrar:</span>
+          <select id="rowsPerPage" style="padding: 0.5rem; border: 1px solid var(--color-border); border-radius: var(--radius-sm);">
+            <option value="10">10 filas</option>
+            <option value="25" selected>25 filas</option>
+            <option value="50">50 filas</option>
+            <option value="100">100 filas</option>
+            <option value="all">Todas</option>
+          </select>
+        </div>
+      </div>
+
       <div id="tablaRegistros">{% include '_tabla_registros.html' %}</div>
+
+      <!-- Paginación -->
+      <div id="pagination" class="pagination"></div>
     </section>
   </main>
 
@@ -140,6 +188,12 @@
   </footer>
 
   <script>
+    // ===== STATE =====
+    let selectedFiles = [];
+    let allRegistros = [];
+    let currentPage = 1;
+    let rowsPerPage = 25;
+
     // ===== Tabs =====
     document.addEventListener('DOMContentLoaded', () => {
       const tabButtons = document.querySelectorAll('.tab-btn');
@@ -154,6 +208,9 @@
           if (tab === 'usb') setTimeout(() => document.getElementById('usbInput')?.focus(), 200);
         });
       });
+
+      // Inicializar búsqueda y paginación
+      initTableFeatures();
     });
 
     // ===== USB input =====
@@ -179,29 +236,215 @@
       });
     }
 
-    // ===== PDF upload =====
+    // ===== DRAG & DROP PDF =====
+    const dropzone = document.getElementById('dropzone');
     const pdfInput = document.getElementById('pdfInput');
-    const pdfFileName = document.getElementById('pdfFileName');
-    const pdfProgress = document.getElementById('pdfProgress');
-    const pdfProgressBar = document.getElementById('pdfProgressBar');
-    if (pdfInput) {
-      pdfInput.addEventListener('change', async () => {
-        const f = pdfInput.files?.[0];
-        if (!f) return;
-        pdfFileName.textContent = f.name;
-        pdfProgress.style.display = 'block';
-        pdfProgressBar.style.width = '15%';
-        const form = new FormData();
-        form.append('pdf_file', f);
-        const res = await fetch('/procesar_pdf', { method: 'POST', body: form });
-        pdfProgressBar.style.width = '60%';
-        const data = await res.json();
-        pdfProgressBar.style.width = '100%';
-        showMessage(data.success, data.message || 'Operación completada');
-        if (data.tabla_html) refreshTable(data.tabla_html, data.total_registros);
-        setTimeout(() => { pdfProgress.style.display = 'none'; pdfProgressBar.style.width = '0%'; }, 600);
-      });
+    const fileList = document.getElementById('fileList');
+    const batchControls = document.getElementById('batchControls');
+    const btnProcessBatch = document.getElementById('btnProcessBatch');
+    const btnClearFiles = document.getElementById('btnClearFiles');
+    const fileCountSpan = document.getElementById('fileCount');
+
+    // Click en dropzone abre selector de archivos
+    dropzone?.addEventListener('click', () => pdfInput?.click());
+
+    // Prevenir comportamiento por defecto en drag & drop
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+      dropzone?.addEventListener(eventName, preventDefaults, false);
+    });
+
+    function preventDefaults(e) {
+      e.preventDefault();
+      e.stopPropagation();
     }
+
+    // Efectos visuales para drag & drop
+    ['dragenter', 'dragover'].forEach(eventName => {
+      dropzone?.addEventListener(eventName, () => {
+        dropzone.classList.add('dragover');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+      dropzone?.addEventListener(eventName, () => {
+        dropzone.classList.remove('dragover');
+      });
+    });
+
+    // Manejar archivos soltados
+    dropzone?.addEventListener('drop', (e) => {
+      const dt = e.dataTransfer;
+      const files = [...dt.files].filter(f => f.type === 'application/pdf');
+      handleFiles(files);
+    });
+
+    // Manejar archivos seleccionados
+    pdfInput?.addEventListener('change', (e) => {
+      const files = [...e.target.files];
+      handleFiles(files);
+      pdfInput.value = ''; // Reset input
+    });
+
+    function handleFiles(files) {
+      if (files.length === 0) return;
+
+      // Agregar archivos nuevos evitando duplicados
+      files.forEach(file => {
+        if (!selectedFiles.some(f => f.name === file.name && f.size === file.size)) {
+          selectedFiles.push({
+            file: file,
+            status: 'pending',
+            message: ''
+          });
+        }
+      });
+
+      updateFileList();
+      updateBatchControls();
+    }
+
+    function updateFileList() {
+      if (selectedFiles.length === 0) {
+        fileList.style.display = 'none';
+        return;
+      }
+
+      fileList.style.display = 'block';
+      fileList.innerHTML = selectedFiles.map((item, index) => {
+        const statusClass = item.status === 'success' ? 'success' : item.status === 'error' ? 'error' : item.status === 'processing' ? 'processing' : '';
+        const statusIcon = item.status === 'success' ? '✓' : item.status === 'error' ? '✗' : item.status === 'processing' ? '<span class="spinner"></span>' : '⏳';
+        const statusText = item.status === 'success' ? 'Completado' : item.status === 'error' ? 'Error' : item.status === 'processing' ? 'Procesando...' : 'Pendiente';
+
+        return `
+          <div class="file-item">
+            <div class="file-info">
+              <span class="file-icon">📄</span>
+              <div class="file-details">
+                <div class="file-name">${item.file.name}</div>
+                <div class="file-size">${formatFileSize(item.file.size)}</div>
+                ${item.message ? `<div style="font-size: 0.85rem; color: var(--color-muted); margin-top: 0.25rem;">${item.message}</div>` : ''}
+              </div>
+            </div>
+            <div class="file-status ${statusClass}">
+              ${statusIcon} ${statusText}
+            </div>
+            ${item.status === 'pending' ? `<button class="file-remove" onclick="removeFile(${index})">✕</button>` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function removeFile(index) {
+      selectedFiles.splice(index, 1);
+      updateFileList();
+      updateBatchControls();
+    }
+
+    function updateBatchControls() {
+      const pendingCount = selectedFiles.filter(f => f.status === 'pending').length;
+
+      if (selectedFiles.length === 0) {
+        batchControls.style.display = 'none';
+      } else {
+        batchControls.style.display = 'flex';
+        fileCountSpan.textContent = pendingCount;
+        btnProcessBatch.disabled = pendingCount === 0;
+      }
+    }
+
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    // Procesar todos los archivos en batch
+    btnProcessBatch?.addEventListener('click', async () => {
+      const pendingFiles = selectedFiles.filter(f => f.status === 'pending');
+      if (pendingFiles.length === 0) return;
+
+      btnProcessBatch.disabled = true;
+      btnClearFiles.disabled = true;
+
+      const overallProgress = document.getElementById('overallProgress');
+      const progressBar = document.getElementById('overallProgressBar');
+      const progressText = document.getElementById('progressText');
+      const successCountEl = document.getElementById('successCount');
+      const errorCountEl = document.getElementById('errorCount');
+
+      overallProgress.style.display = 'block';
+
+      let completed = 0;
+      let successCount = 0;
+      let errorCount = 0;
+      const total = pendingFiles.length;
+
+      // Procesar archivos secuencialmente para evitar sobrecarga
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const item = selectedFiles[i];
+        if (item.status !== 'pending') continue;
+
+        item.status = 'processing';
+        updateFileList();
+
+        try {
+          const formData = new FormData();
+          formData.append('pdf_file', item.file);
+
+          const response = await fetch('/procesar_pdf', {
+            method: 'POST',
+            body: formData
+          });
+
+          const data = await response.json();
+
+          if (data.success) {
+            item.status = 'success';
+            item.message = data.message || 'Procesado correctamente';
+            successCount++;
+
+            // Actualizar tabla
+            if (data.tabla_html) {
+              refreshTable(data.tabla_html, data.total_registros);
+            }
+          } else {
+            item.status = 'error';
+            item.message = data.message || 'Error al procesar';
+            errorCount++;
+          }
+        } catch (error) {
+          item.status = 'error';
+          item.message = 'Error de conexión';
+          errorCount++;
+        }
+
+        completed++;
+        const progress = (completed / total) * 100;
+        progressBar.style.width = progress + '%';
+        progressText.textContent = `${completed} de ${total}`;
+        successCountEl.textContent = successCount;
+        errorCountEl.textContent = errorCount;
+
+        updateFileList();
+      }
+
+      btnClearFiles.disabled = false;
+
+      // Ocultar barra de progreso después de 2 segundos
+      setTimeout(() => {
+        overallProgress.style.display = 'none';
+        progressBar.style.width = '0%';
+      }, 2000);
+
+      showMessage(true, `Procesamiento completado: ${successCount} exitosos, ${errorCount} errores`);
+    });
+
+    // Limpiar lista de archivos
+    btnClearFiles?.addEventListener('click', () => {
+      selectedFiles = [];
+      updateFileList();
+      updateBatchControls();
+    });
 
     // ===== Cámara (jsQR) =====
     let stream = null;
@@ -291,15 +534,183 @@
     function refreshTable(html, total) {
       document.getElementById('tablaRegistros').innerHTML = html;
       document.getElementById('totalRegistros').textContent = total;
+
+      // Reinicializar búsqueda y paginación
+      extractTableData();
+      const query = document.getElementById('searchInput')?.value.toLowerCase().trim() || '';
+      if (query) {
+        renderFilteredTable(query);
+      } else {
+        currentPage = 1;
+        renderFilteredTable('');
+      }
     }
 
     // Limpiar todo
     document.getElementById('btnLimpiar')?.addEventListener('click', async () => {
+      if (!confirm('¿Está seguro de que desea limpiar todos los registros?')) return;
+
       const res = await fetch('/limpiar_registros', { method: 'POST' });
       const data = await res.json();
       showMessage(data.success, data.message || 'Listo');
-      if (data.tabla_html) refreshTable(data.tabla_html, 0);
+      if (data.tabla_html) {
+        refreshTable(data.tabla_html, 0);
+        allRegistros = [];
+        initTableFeatures();
+      }
     });
+
+    // ===== TABLE SEARCH & PAGINATION =====
+    function initTableFeatures() {
+      const searchInput = document.getElementById('searchInput');
+      const rowsPerPageSelect = document.getElementById('rowsPerPage');
+
+      // Extraer datos de la tabla
+      extractTableData();
+
+      // Search
+      searchInput?.addEventListener('input', (e) => {
+        const query = e.target.value.toLowerCase().trim();
+        currentPage = 1;
+        renderFilteredTable(query);
+      });
+
+      // Rows per page
+      rowsPerPageSelect?.addEventListener('change', (e) => {
+        rowsPerPage = e.target.value === 'all' ? allRegistros.length : parseInt(e.target.value);
+        currentPage = 1;
+        const query = searchInput?.value.toLowerCase().trim() || '';
+        renderFilteredTable(query);
+      });
+    }
+
+    function extractTableData() {
+      const table = document.querySelector('.registros-table');
+      if (!table) {
+        allRegistros = [];
+        return;
+      }
+
+      const rows = table.querySelectorAll('tbody tr');
+      allRegistros = Array.from(rows).map(row => {
+        const cells = row.querySelectorAll('td');
+        return {
+          numero: cells[0]?.textContent.trim() || '',
+          registrado: cells[1]?.textContent.trim() || '',
+          curp: cells[2]?.textContent.trim() || '',
+          padre: cells[3]?.textContent.trim() || '',
+          madre: cells[4]?.textContent.trim() || '',
+          municipio: cells[5]?.textContent.trim() || '',
+          fechaNac: cells[6]?.textContent.trim() || '',
+          horaEscaneo: cells[7]?.textContent.trim() || ''
+        };
+      });
+    }
+
+    function renderFilteredTable(query) {
+      let filtered = allRegistros;
+
+      // Filtrar por búsqueda
+      if (query) {
+        filtered = allRegistros.filter(reg => {
+          return (
+            reg.registrado.toLowerCase().includes(query) ||
+            reg.curp.toLowerCase().includes(query) ||
+            reg.padre.toLowerCase().includes(query) ||
+            reg.madre.toLowerCase().includes(query) ||
+            reg.municipio.toLowerCase().includes(query)
+          );
+        });
+      }
+
+      // Paginación
+      const total = filtered.length;
+      const totalPages = Math.ceil(total / rowsPerPage);
+      const start = (currentPage - 1) * rowsPerPage;
+      const end = start + rowsPerPage;
+      const paged = filtered.slice(start, end);
+
+      // Renderizar tabla
+      const tableContainer = document.getElementById('tablaRegistros');
+      if (paged.length === 0) {
+        tableContainer.innerHTML = '<div class="empty-table" style="padding: 2rem; text-align: center; color: var(--color-muted);">No se encontraron registros</div>';
+      } else {
+        tableContainer.innerHTML = `
+          <div class="table-container">
+            <table class="registros-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Registrado</th>
+                  <th>CURP</th>
+                  <th>Padre</th>
+                  <th>Madre</th>
+                  <th>Municipio</th>
+                  <th>Fecha Nac.</th>
+                  <th>Hora Escaneo</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${paged.map((reg, idx) => `
+                  <tr>
+                    <td class="numero">${start + idx + 1}</td>
+                    <td>${reg.registrado || '-'}</td>
+                    <td class="curp-cell">${reg.curp || '-'}</td>
+                    <td>${reg.padre || '-'}</td>
+                    <td>${reg.madre || '-'}</td>
+                    <td>${reg.municipio || '-'}</td>
+                    <td>${reg.fechaNac || '-'}</td>
+                    <td>${reg.horaEscaneo || '-'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      // Renderizar paginación
+      renderPagination(totalPages, total);
+    }
+
+    function renderPagination(totalPages, totalRecords) {
+      const pagination = document.getElementById('pagination');
+      if (!pagination) return;
+
+      if (totalPages <= 1) {
+        pagination.innerHTML = '';
+        return;
+      }
+
+      let html = '<button class="pagination-btn" onclick="changePage(1)" ' + (currentPage === 1 ? 'disabled' : '') + '>« Primera</button>';
+      html += '<button class="pagination-btn" onclick="changePage(' + (currentPage - 1) + ')" ' + (currentPage === 1 ? 'disabled' : '') + '>‹ Anterior</button>';
+
+      // Páginas numéricas
+      const maxButtons = 5;
+      let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2));
+      let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+
+      if (endPage - startPage < maxButtons - 1) {
+        startPage = Math.max(1, endPage - maxButtons + 1);
+      }
+
+      for (let i = startPage; i <= endPage; i++) {
+        html += `<button class="pagination-btn ${i === currentPage ? 'active' : ''}" onclick="changePage(${i})">${i}</button>`;
+      }
+
+      html += '<button class="pagination-btn" onclick="changePage(' + (currentPage + 1) + ')" ' + (currentPage === totalPages ? 'disabled' : '') + '>Siguiente ›</button>';
+      html += '<button class="pagination-btn" onclick="changePage(' + totalPages + ')" ' + (currentPage === totalPages ? 'disabled' : '') + '>Última »</button>';
+
+      html += `<span class="pagination-info">Mostrando ${((currentPage - 1) * rowsPerPage) + 1}-${Math.min(currentPage * rowsPerPage, totalRecords)} de ${totalRecords}</span>`;
+
+      pagination.innerHTML = html;
+    }
+
+    function changePage(page) {
+      currentPage = page;
+      const query = document.getElementById('searchInput')?.value.toLowerCase().trim() || '';
+      renderFilteredTable(query);
+    }
   </script>
 
   <!-- Si usas main.js adicional, mantenlo debajo -->
