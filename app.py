@@ -1,380 +1,335 @@
-import re
-import os
-import base64
-import tempfile
-from io import BytesIO
-from threading import RLock
+"""
+Aplicación Flask para escaneo y procesamiento de actas de nacimiento.
+Sistema oficial de digitalización OFS Tlaxcala.
+
+Funcionalidades:
+- Escaneo de QR desde cámara, scanner USB o imágenes
+- Procesamiento de PDFs con extracción de QR o texto
+- Generación de reportes en Excel
+- Gestión de registros en memoria con protección de duplicados
+
+Autor: Omar Gabriel Salvatierra García
+Año: 2025
+"""
 from datetime import datetime
-
-import openpyxl
-from openpyxl import Workbook
 from flask import Flask, render_template, request, jsonify, send_file
-import cv2
-import numpy as np
-import fitz  # PyMuPDF
 
+# Configuración y utilidades
+from config import Config
+from utils.logger import get_app_logger, log_system_start
+
+# Modelos
+from models import RegistroManager
+
+# Servicios
+from services import DataParser, QRProcessor, PDFProcessor, ExcelGenerator
+
+# ===== Inicialización =====
 app = Flask(__name__)
+app.config['SECRET_KEY'] = Config.SECRET_KEY
 
-# ===== Config =====
-ENCABEZADOS = [
-    'Tomo', 'Libro', 'Foja', 'Acta', 'Entidad', 'Municipio',
-    'CURP', 'Registrado', 'Padre', 'Madre', 'FechaNacimiento',
-    'Sexo', 'FechaRegistro', 'Oficial', 'Folio', 'FechaEscaneo'
-]
+# Logger principal
+logger = get_app_logger()
 
-# Registros en memoria (no se guardan en disco)
-REGISTROS = []
-_LOCK = RLock()
+# Registrar inicio del sistema
+log_system_start()
 
+# Gestor de registros global
+registro_manager = RegistroManager()
 
-# ===== Utilidades =====
-def normalizar_clave(raw_key):
-    mapeo_claves = {
-        'padre1': 'Padre',
-        'padre2': 'Madre',
-        'registrado': 'Registrado',
-        'curp': 'CURP',
-        'tomo': 'Tomo',
-        'libro': 'Libro',
-        'foja': 'Foja',
-        'acta': 'Acta',
-        'entidad': 'Entidad',
-        'municipio': 'Municipio',
-        'fechanacimiento': 'FechaNacimiento',
-        'sexo': 'Sexo',
-        'fechaimpresion': 'FechaRegistro',
-        'impreso en': 'Oficial',
-        'cadena': 'Folio'
-    }
-    return mapeo_claves.get(
-        raw_key.lower().replace(' ', '').replace('í', 'i'),
-        raw_key
-    )
-
-
-def parsear_qr(data):
-    data = re.sub(r'([^,])CURP', r'\1,CURP', data, flags=re.IGNORECASE)
-    data = re.sub(r'([^,])Padre', r'\1,Padre', data, flags=re.IGNORECASE)
-    patron = re.compile(r'(\b[\w\s]+?):(.+?)(?=\s*[\w\s]+:|$)', re.IGNORECASE)
-    matches = patron.findall(data)
-    registro = {}
-    for k, v in matches:
-        clave_normalizada = normalizar_clave(k.strip())
-        registro[clave_normalizada] = v.strip(' ,;')
-    registro['FechaEscaneo'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    return registro
-
-
-def _clave_registro(registro):
-    return registro.get('Folio') or registro.get('CURP')
-
-
-def guardar_registro(registro):
-    """Guarda en memoria. Evita duplicados por Folio o CURP."""
-    try:
-        clave = _clave_registro(registro)
-        if not clave:
-            return False, "Error: No se encontró Folio ni CURP en el código QR."
-
-        with _LOCK:
-            for r in REGISTROS:
-                if (registro.get('Folio') and r.get('Folio') == registro.get('Folio')) or \
-                   (registro.get('CURP') and r.get('CURP') == registro.get('CURP')):
-                    return False, f"Acta DUPLICADA. Ya existe {('Folio: '+registro.get('Folio')) if registro.get('Folio') else ('CURP: '+registro.get('CURP'))}."
-
-            # normalizar orden de columnas
-            fila = {h: registro.get(h, '') for h in ENCABEZADOS}
-            REGISTROS.append(fila)
-
-        return True, f"Acta registrada ({'Folio' if registro.get('Folio') else 'CURP'}: {clave}) exitosamente"
-    except Exception as e:
-        return False, f"Error al guardar: {str(e)}"
-
-
-def obtener_registros():
-    with _LOCK:
-        # Más recientes primero por FechaEscaneo
-        return sorted(
-            REGISTROS,
-            key=lambda r: r.get('FechaEscaneo', ''),
-            reverse=True
-        )
-
-
-def procesar_imagen_qr(image_data):
-    try:
-        if 'base64,' in image_data:
-            image_data = image_data.split('base64,')[1]
-        image_bytes = base64.b64decode(image_data)
-        np_array = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        qr_detector = cv2.QRCodeDetector()
-        data, bbox, _ = qr_detector.detectAndDecode(img)
-        return data.strip() if data else None
-    except Exception:
-        return None
-
-
-def extraer_qr_desde_pdf(pdf_bytes):
-    """Usa archivo temporal y lo borra inmediatamente."""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            temp_file.write(pdf_bytes)
-            temp_path = temp_file.name
-
-        qr_codes = []
-        pdf_document = fitz.open(temp_path)
-
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_data = pix.tobytes("png")
-            np_array = np.frombuffer(img_data, np.uint8)
-            img = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-            if img is not None:
-                qr_detector = cv2.QRCodeDetector()
-                data, bbox, _ = qr_detector.detectAndDecode(img)
-                if data and data.strip():
-                    qr_codes.append(data.strip())
-
-        pdf_document.close()
-        os.unlink(temp_path)
-        return qr_codes
-    except Exception:
-        return []
-
-
-def convertir_fecha(fecha_str):
-    try:
-        if '/' in fecha_str:
-            d, m, a = fecha_str.split('/')
-            return f"{a}-{m}-{d}"
-        return fecha_str
-    except Exception:
-        return fecha_str
-
-
-def parsear_texto_acta(texto):
-    registro = {}
-    try:
-        patrones = {
-            'CURP': r'Clave Única de Registro de Población\s*([A-Z0-9]{18})',
-            'Folio': r'Identificador Electrónico\s*(\d+)',
-            'Entidad': r'Entidad de Registro\s*([A-ZÁÉÍÓÚÜÑ\s]+)',
-            'Municipio': r'Municipio de Registro\s*([A-ZÁÉÍÓÚÜÑ\s]+)',
-            'Oficial': r'Oficialía\s*(\d+)',
-            'FechaRegistro': r'Fecha de Registro\s*(\d{2}/\d{2}/\d{4})',
-            'Libro': r'Libro\s*(\d+)',
-            'Acta': r'Número de Acta\s*(\d+)',
-            'Registrado': r'Nombre\(s\):\s*([^\n]+)\s*Primer Apellido:\s*([^\n]+)\s*Segundo Apellido:\s*([^\n]+)',
-            'Sexo': r'Sexo:\s*([^\n]+)',
-            'FechaNacimiento': r'Fecha de Nacimiento:\s*(\d{2}/\d{2}/\d{4})',
-        }
-
-        m = re.search(patrones['CURP'], texto)
-        if m: registro['CURP'] = m.group(1)
-
-        m = re.search(patrones['Folio'], texto)
-        if m: registro['Folio'] = m.group(1)
-
-        m = re.search(patrones['Entidad'], texto)
-        if m: registro['Entidad'] = m.group(1).strip()
-
-        m = re.search(patrones['Municipio'], texto)
-        if m: registro['Municipio'] = m.group(1).strip()
-
-        m = re.search(patrones['Oficial'], texto)
-        if m: registro['Oficial'] = m.group(1)
-
-        m = re.search(patrones['FechaRegistro'], texto)
-        if m: registro['FechaRegistro'] = convertir_fecha(m.group(1))
-
-        m = re.search(patrones['Libro'], texto)
-        if m: registro['Libro'] = m.group(1)
-
-        m = re.search(patrones['Acta'], texto)
-        if m: registro['Acta'] = m.group(1)
-
-        m = re.search(patrones['Registrado'], texto, re.DOTALL)
-        if m:
-            registro['Registrado'] = f"{m.group(1).strip()} {m.group(2).strip()} {m.group(3).strip()}"
-
-        m = re.search(patrones['Sexo'], texto)
-        if m:
-            sexo = m.group(1).strip().upper()
-            registro['Sexo'] = 'H' if 'HOMB' in sexo else 'M' if 'MUJ' in sexo else sexo
-
-        m = re.search(patrones['FechaNacimiento'], texto)
-        if m: registro['FechaNacimiento'] = convertir_fecha(m.group(1))
-
-        registro['Padre'] = registro.get('Padre', '')
-        registro['Madre'] = registro.get('Madre', '')
-        registro['Tomo'] = registro.get('Tomo', '')
-        registro['Foja'] = registro.get('Foja', '')
-        registro['FechaEscaneo'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        return registro
-    except Exception:
-        return None
-
-
-def extraer_datos_desde_texto_pdf(pdf_bytes):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            temp_file.write(pdf_bytes)
-            temp_path = temp_file.name
-
-        pdf_document = fitz.open(temp_path)
-        texto = ""
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
-            texto += page.get_text()
-        pdf_document.close()
-        os.unlink(temp_path)
-        return parsear_texto_acta(texto)
-    except Exception:
-        return None
-
-
-def procesar_pdf_con_fallback(pdf_bytes):
-    qr_codes = extraer_qr_desde_pdf(pdf_bytes)
-    if qr_codes:
-        return qr_codes, 'qr'
-    registro = extraer_datos_desde_texto_pdf(pdf_bytes)
-    if registro:
-        return [registro], 'texto'
-    return [], 'fallo'
+logger.info(f"Aplicación {Config.APP_NAME} v{Config.APP_VERSION} inicializada")
+logger.info(f"Configuración: DEBUG={Config.DEBUG}, HOST={Config.HOST}, PORT={Config.PORT}")
 
 
 # ===== Rutas =====
+
 @app.route('/')
 def index():
-    registros = obtener_registros()
-    return render_template('index.html', registros=registros, total=len(registros), current_year=datetime.now().year)
+    """Página principal de la aplicación."""
+    try:
+        logger.info("Acceso a página principal")
+        registros = registro_manager.obtener_todos()
+        total = registro_manager.contar()
+
+        logger.debug(f"Renderizando index con {total} registro(s)")
+
+        return render_template(
+            'index.html',
+            registros=registros,
+            total=total,
+            current_year=datetime.now().year
+        )
+
+    except Exception as e:
+        logger.error(f"Error al renderizar página principal: {e}", exc_info=True)
+        return f"Error interno del servidor: {str(e)}", 500
 
 
 @app.route('/procesar_qr', methods=['POST'])
 def procesar_qr():
+    """
+    Procesa datos de QR recibidos como texto (desde scanner USB).
+
+    Espera JSON: {"qr_data": "..."}
+    Retorna JSON con resultado del procesamiento.
+    """
     try:
+        logger.info("=== Procesando QR desde texto ===")
+
         data = request.json.get('qr_data', '').strip()
+
         if not data:
+            logger.warning("Recibidos datos QR vacíos")
             return jsonify({'success': False, 'message': 'Datos QR vacíos'})
-        registro = parsear_qr(data)
-        success, message = guardar_registro(registro)
-        tabla_html = render_template('_tabla_registros.html', registros=obtener_registros())
+
+        logger.info(f"Datos QR recibidos (longitud: {len(data)})")
+
+        # Parsear datos del QR
+        datos_parseados = DataParser.parsear_qr(data)
+
+        # Crear registro
+        registro = registro_manager.crear_desde_dict(datos_parseados)
+
+        # Guardar
+        success, message = registro_manager.agregar(registro)
+
+        # Renderizar tabla actualizada
+        tabla_html = render_template(
+            '_tabla_registros.html',
+            registros=registro_manager.obtener_todos()
+        )
+
+        logger.info(f"QR procesado: {success} - {message}")
+
         return jsonify({
             'success': success,
             'message': message,
-            'total_registros': len(obtener_registros()),
+            'total_registros': registro_manager.contar(),
             'tabla_html': tabla_html
         })
+
     except Exception as e:
+        logger.error(f"Error al procesar QR: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Error interno: {str(e)}'}), 500
 
 
 @app.route('/procesar_imagen_qr', methods=['POST'])
-def procesar_imagen_qr_route():
+def procesar_imagen_qr():
+    """
+    Procesa una imagen en base64 para extraer código QR.
+
+    Espera JSON: {"image_data": "data:image/png;base64,..."}
+    Retorna JSON con resultado del procesamiento.
+    """
     try:
+        logger.info("=== Procesando imagen para detección de QR ===")
+
         image_data = request.json.get('image_data', '')
+
         if not image_data:
+            logger.warning("No se recibió imagen")
             return jsonify({'success': False, 'message': 'No se recibió imagen'})
-        qr_text = procesar_imagen_qr(image_data)
+
+        # Procesar imagen
+        qr_text = QRProcessor.procesar_imagen(image_data)
+
         if qr_text:
-            registro = parsear_qr(qr_text)
-            success, message = guardar_registro(registro)
-            tabla_html = render_template('_tabla_registros.html', registros=obtener_registros())
+            logger.info("QR detectado en imagen")
+
+            # Parsear y guardar
+            datos_parseados = DataParser.parsear_qr(qr_text)
+            registro = registro_manager.crear_desde_dict(datos_parseados)
+            success, message = registro_manager.agregar(registro)
+
+            # Renderizar tabla
+            tabla_html = render_template(
+                '_tabla_registros.html',
+                registros=registro_manager.obtener_todos()
+            )
+
             return jsonify({
                 'success': success,
                 'message': message,
                 'qr_data': qr_text,
-                'total_registros': len(obtener_registros()),
+                'total_registros': registro_manager.contar(),
                 'tabla_html': tabla_html
             })
-        return jsonify({'success': False, 'message': 'No se detectó QR'})
+        else:
+            logger.warning("No se detectó QR en la imagen")
+            return jsonify({'success': False, 'message': 'No se detectó QR en la imagen'})
+
     except Exception as e:
+        logger.error(f"Error al procesar imagen QR: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Error procesando imagen: {str(e)}'}), 500
 
 
 @app.route('/procesar_pdf', methods=['POST'])
 def procesar_pdf():
+    """
+    Procesa un archivo PDF para extraer datos de actas.
+
+    Intenta primero extraer códigos QR, luego texto si no hay QR.
+    Espera: multipart/form-data con campo 'pdf_file'
+    Retorna JSON con resultado del procesamiento.
+    """
     try:
+        logger.info("=" * 80)
+        logger.info("=== Procesando PDF ===")
+
+        # Validar que se recibió archivo
         if 'pdf_file' not in request.files:
+            logger.warning("No se recibió archivo PDF en la petición")
             return jsonify({'success': False, 'message': 'No se recibió archivo PDF'})
+
         pdf_file = request.files['pdf_file']
+
+        # Validar extensión
         if not pdf_file.filename.lower().endswith('.pdf'):
+            logger.warning(f"Archivo recibido no es PDF: {pdf_file.filename}")
             return jsonify({'success': False, 'message': 'El archivo debe ser un PDF'})
 
-        pdf_bytes = pdf_file.read()
-        hallados, metodo = procesar_pdf_con_fallback(pdf_bytes)
-        if not hallados:
-            return jsonify({'success': False, 'message': 'Sin QR y sin texto útil'})
+        logger.info(f"Procesando PDF: {pdf_file.filename}")
 
+        # Leer bytes del PDF
+        pdf_bytes = pdf_file.read()
+        logger.info(f"PDF leído: {len(pdf_bytes)} bytes")
+
+        # Procesar con fallback (QR -> texto)
+        hallados, metodo = PDFProcessor.procesar_pdf_con_fallback(pdf_bytes)
+
+        if not hallados:
+            logger.warning("No se pudo extraer información del PDF")
+            return jsonify({
+                'success': False,
+                'message': 'No se encontró QR ni texto procesable en el PDF'
+            })
+
+        logger.info(f"Método utilizado: {metodo}, elementos encontrados: {len(hallados)}")
+
+        # Procesar cada elemento encontrado
         resultados = []
-        ok = 0
+        exitosos = 0
+
         for item in hallados:
             if metodo == 'qr':
-                registro = parsear_qr(item)
+                # Item es string del QR
+                datos_parseados = DataParser.parsear_qr(item)
+                registro = registro_manager.crear_desde_dict(datos_parseados)
             else:
-                registro = item
-            success, message = guardar_registro(registro)
-            resultados.append({'metodo': metodo, 'success': success, 'message': message})
-            if success:
-                ok += 1
+                # Item ya es diccionario
+                registro = registro_manager.crear_desde_dict(item)
 
-        tabla_html = render_template('_tabla_registros.html', registros=obtener_registros())
+            success, message = registro_manager.agregar(registro)
+            resultados.append({
+                'metodo': metodo,
+                'success': success,
+                'message': message
+            })
+
+            if success:
+                exitosos += 1
+
+        # Renderizar tabla
+        tabla_html = render_template(
+            '_tabla_registros.html',
+            registros=registro_manager.obtener_todos()
+        )
+
+        mensaje_final = f'Procesados {exitosos}/{len(hallados)} registro(s) usando {metodo}'
+        logger.info(f"PDF procesado: {mensaje_final}")
+        logger.info("=" * 80)
+
         return jsonify({
             'success': True,
-            'message': f'Procesados {ok}/{len(hallados)} usando {metodo}',
+            'message': mensaje_final,
             'metodo_utilizado': metodo,
             'resultados': resultados,
-            'total_registros': len(obtener_registros()),
+            'total_registros': registro_manager.contar(),
             'tabla_html': tabla_html
         })
+
     except Exception as e:
+        logger.error(f"Error al procesar PDF: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Error procesando PDF: {str(e)}'}), 500
 
 
 @app.route('/descargar_excel')
 def descargar_excel():
-    """Genera Excel en memoria. No escribe a disco."""
+    """
+    Genera y descarga archivo Excel con todos los registros.
+
+    El archivo se genera en memoria (no se escribe a disco).
+    Retorna archivo Excel o JSON con error.
+    """
     try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Actas Escaneadas"
-        for col, encabezado in enumerate(ENCABEZADOS, 1):
-            c = ws.cell(row=1, column=col, value=encabezado)
-            c.font = openpyxl.styles.Font(bold=True)
+        logger.info("=== Generando Excel para descarga ===")
 
-        for r in obtener_registros():
-            ws.append([r.get(h, '') for h in ENCABEZADOS])
+        registros = registro_manager.obtener_todos()
+        logger.info(f"Generando Excel con {len(registros)} registro(s)")
 
-        bio = BytesIO()
-        wb.save(bio)
-        bio.seek(0)
+        if not registros:
+            logger.warning("Intento de descargar Excel sin registros")
+            return jsonify({
+                'success': False,
+                'message': 'No hay registros para exportar'
+            }), 400
 
-        nombre = f"actas_escaneadas_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        # Generar Excel en memoria
+        excel_file = ExcelGenerator.generar_excel(registros)
+        nombre_archivo = ExcelGenerator.generar_nombre_archivo()
+
+        logger.info(f"Excel generado exitosamente: {nombre_archivo}")
+
         return send_file(
-            bio,
+            excel_file,
             as_attachment=True,
-            download_name=nombre,
+            download_name=nombre_archivo,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
+
     except Exception as e:
+        logger.error(f"Error al generar Excel: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Error al descargar: {str(e)}'}), 500
 
 
 @app.route('/limpiar_registros', methods=['POST'])
 def limpiar_registros():
+    """
+    Limpia todos los registros de la memoria.
+
+    Retorna JSON con resultado de la operación.
+    """
     try:
-        with _LOCK:
-            REGISTROS.clear()
+        logger.info("=== Limpiando registros ===")
+
+        success, message = registro_manager.limpiar()
+
+        # Renderizar tabla vacía
         tabla_html = render_template('_tabla_registros.html', registros=[])
-        return jsonify({'success': True, 'message': 'Registros limpiados', 'tabla_html': tabla_html})
+
+        logger.info(f"Limpieza completada: {message}")
+
+        return jsonify({
+            'success': success,
+            'message': message,
+            'tabla_html': tabla_html
+        })
+
     except Exception as e:
+        logger.error(f"Error al limpiar registros: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Error al limpiar: {str(e)}'}), 500
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5045)
+# ===== Punto de entrada =====
 
+if __name__ == '__main__':
+    logger.info("=" * 80)
+    logger.info(f"Iniciando servidor Flask en {Config.HOST}:{Config.PORT}")
+    logger.info(f"Modo DEBUG: {Config.DEBUG}")
+    logger.info("=" * 80)
+
+    app.run(
+        debug=Config.DEBUG,
+        host=Config.HOST,
+        port=Config.PORT
+    )
