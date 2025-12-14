@@ -376,5 +376,5 @@ def limpiar_registros():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5045)
+    app.run(debug=True, host='0.0.0.0', port=5008)
 
